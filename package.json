@@ -1,0 +1,16 @@
+{
+  "name": "csv-to-sql-converter",
+  "version": "1.0.0",
+  "description": "CSV verilerini PostgreSQL SQL insert ifadelerine dönüştürür",
+  "main": "converter.js",
+  "scripts": {
+    "start": "node converter.js",
+    "convert": "node converter.js"
+  },
+  "dependencies": {
+    "csv-parser": "^3.0.0"
+  },
+  "keywords": ["csv", "sql", "postgresql", "data-migration"],
+  "author": "",
+  "license": "MIT"
+}
