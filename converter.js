@@ -1,6 +1,5 @@
 const fs = require('fs');
 const csv = require('csv-parser');
-const { parse } = require('json2csv');
 
 // Konfigürasyon
 const CONFIG = {
@@ -12,31 +11,37 @@ const CONFIG = {
   // ID mapping için (gerçek veritabanından alınması gerekenler)
   countryMapping: {
     'egypt': 1,
+    'usa': 2,
+    'turkey': 3
     // Diğer ülkeler...
   },
   companyTypeMapping: {
     'LLC': 1,
+    'C-Corp': 2,
+    'S-Corp': 3
     // Diğer şirket türleri...
   },
   industryTypeMapping: {
     'Other': 1,
     'Transportation': 2,
+    'Technology': 3,
+    'Consulting': 4
     // Diğer sektörler...
   },
   productMapping: {
     'incorporation': 1,
     'itin_application': 2,
-    'operating_agreement': 3,
+    'operating_agreement': 3
     // Diğer ürünler...
   }
 };
 
 // ID counters
-let orderId = 1;
-let orderItemId = 1;
-let incorporationId = 1;
-let itinApplicationId = 1;
-let operatingAgreementId = 1;
+let orderId = 1000; // Mevcut veritabanından son ID'yi kullanın
+let orderItemId = 1000;
+let incorporationId = 1000;
+let itinApplicationId = 1000;
+let operatingAgreementId = 1000;
 
 // Toplanacak veriler
 const orders = [];
@@ -52,6 +57,11 @@ async function processCSV() {
   const rows = [];
   
   return new Promise((resolve, reject) => {
+    if (!fs.existsSync(CONFIG.inputFile)) {
+      reject(new Error(`CSV dosyası bulunamadı: ${CONFIG.inputFile}`));
+      return;
+    }
+    
     fs.createReadStream(CONFIG.inputFile)
       .pipe(csv())
       .on('data', (row) => {
@@ -72,13 +82,18 @@ function groupAndProcessData(rows) {
   
   // Order'lara göre grupla
   rows.forEach(row => {
-    const orderNumber = row.order_number;
+    const orderNumber = (row.order_number || '').trim();
+    if (!orderNumber) {
+      console.warn('Uyarı: order_number olmayan satır atlandı');
+      return;
+    }
+    
     if (!ordersMap.has(orderNumber)) {
       ordersMap.set(orderNumber, []);
     }
     ordersMap.get(orderNumber).push({
-      field_title: row.field_title,
-      field_value: row.field_value
+      field_title: (row.field_title || '').trim(),
+      field_value: (row.field_value || '').trim()
     });
   });
   
@@ -89,7 +104,9 @@ function groupAndProcessData(rows) {
     // Field'ları obje haline getir
     const fieldObj = {};
     fields.forEach(field => {
-      fieldObj[field.field_title.trim()] = field.field_value;
+      if (field.field_title && field.field_value !== undefined) {
+        fieldObj[field.field_title] = field.field_value;
+      }
     });
     
     // 1. Order oluştur
@@ -127,10 +144,16 @@ function groupAndProcessData(rows) {
 
 // Order oluştur
 function createOrder(orderNumber, fields) {
+  // WooCommerce order ID'sini orderNumber'dan çıkar (eğer sayısal ise)
+  let woocommerceOrderId = null;
+  if (/^\d+$/.test(orderNumber)) {
+    woocommerceOrderId = parseInt(orderNumber);
+  }
+  
   return {
     id: orderId,
     user_id: CONFIG.defaultUserId,
-    woocommerce_order_id: null, // CSV'de yok, orderNumber string olduğu için
+    woocommerce_order_id: woocommerceOrderId,
     company: null,
     currency: 'USD',
     discount_total: 0,
@@ -145,7 +168,13 @@ function createOrder(orderNumber, fields) {
 function createOrderItem(orderId, fields) {
   // Hizmet tipini belirle (field'lara göre)
   let serviceId = CONFIG.productMapping.incorporation; // Varsayılan
-  let productName = 'Incorporation Service';
+  let productName = 'LLC Incorporation Service';
+  
+  // Eğer ITIN başvurusu varsa
+  if (hasItinApplication(fields)) {
+    serviceId = CONFIG.productMapping.itin_application;
+    productName = 'ITIN Application Service';
+  }
   
   return {
     id: orderItemId,
@@ -155,7 +184,7 @@ function createOrderItem(orderId, fields) {
     woocommerce_product_id: null,
     product_id: serviceId,
     order_source: 'woocommerce',
-    sku: 'INC-001',
+    sku: serviceId === CONFIG.productMapping.incorporation ? 'INC-001' : 'ITIN-001',
     product_name: productName,
     quantity: 1,
     subtotal: 0,
@@ -185,7 +214,11 @@ function createIncorporation(orderItemId, fields) {
   const companyTypeId = CONFIG.companyTypeMapping[companyTypeName] || 1;
   
   // Industry type mapping
-  const industryTypeName = fields['Industry'] || 'Other';
+  let industryTypeName = fields['Industry'] || 'Other';
+  // Eğer "Other" seçilmişse ve açıklama varsa
+  if (industryTypeName === 'Other' && fields['If selected Other, please specify']) {
+    industryTypeName = fields['If selected Other, please specify'];
+  }
   const industryTypeId = CONFIG.industryTypeMapping[industryTypeName] || 1;
   
   // Revenue bilgisi
@@ -200,7 +233,22 @@ function createIncorporation(orderItemId, fields) {
   // Address parsing
   const address = fields['Street Address'] || '';
   const cityStateDistrict = fields['City/State/District'] || '';
-  const [city, state, district] = cityStateDistrict.split(' - ');
+  const parts = cityStateDistrict.split(' - ');
+  const city = parts[0] || '';
+  const state = parts[1] || '';
+  const district = parts[2] || '';
+  
+  // Email kontrolü
+  let email = fields['E-mail'] || '';
+  if (!email && fields['E-mail Address']) {
+    email = fields['E-mail Address'];
+  }
+  
+  // Phone number
+  let phone = fields['Phone Number (with country code)'] || '';
+  if (!phone && fields['Phone Number']) {
+    phone = fields['Phone Number'];
+  }
   
   return {
     id: incorporationId,
@@ -209,13 +257,13 @@ function createIncorporation(orderItemId, fields) {
     first_name: fields['First Name'] || '',
     middle_name: fields['Middle Name (if applicable)'] || '',
     last_name: fields['Last Name (Surname)'] || '',
-    email: fields['E-mail'] || '',
-    phone_number: fields['Phone Number (with country code)'] || '',
+    email: email,
+    phone_number: phone,
     address: address,
     country: countryId,
-    state: state || '',
-    city: city || '',
-    country_code: extractCountryCode(fields['Phone Number (with country code)']),
+    state: state,
+    city: city,
+    country_code: extractCountryCode(phone),
     zip_code: fields['Zip Code'] || '',
     company_members: companyMembers,
     company_type: companyTypeId,
@@ -233,7 +281,8 @@ function createIncorporation(orderItemId, fields) {
     extracted_data: JSON.stringify({
       birth_name: fields['Please indicate if the above Name/Surname is the same as your birth Name/Surname'] || '',
       entity_ending: fields['Entity Ending'] || '',
-      other_industry: fields['If selected Other, please specify'] || ''
+      other_industry: fields['If selected Other, please specify'] || '',
+      order_number: fields['Order Number'] || ''
     }),
     created_at: CONFIG.currentTimestamp,
     last_updated_at: CONFIG.currentTimestamp,
@@ -265,7 +314,10 @@ function createItinApplication(orderItemId, fields) {
     deleted_at: null,
     is_deleted: false,
     status: 1,
-    extracted_data: null,
+    extracted_data: JSON.stringify({
+      applicant_name: `${fields['First Name'] || ''} ${fields['Last Name (Surname)'] || ''}`.trim(),
+      address: fields['Street Address'] || ''
+    }),
     w7_form_extracted_data: null,
     form_2848_extracted_data: null,
     w7_signed_form: null,
@@ -298,12 +350,15 @@ function createOperatingAgreement(orderItemId, fields) {
 // Yardımcı fonksiyonlar
 function hasItinApplication(fields) {
   // ITIN başvurusu gerekip gerekmediğini belirleyen logic
-  return fields['First name'] && fields['Last Name']; // Örnek kontrol
+  // Örnek: Eğer "ITIN" veya "W-7" gibi kelimeler geçiyorsa
+  const businessDesc = (fields['Business Description'] || '').toLowerCase();
+  return businessDesc.includes('itin') || businessDesc.includes('w-7') || businessDesc.includes('tax id');
 }
 
 function hasOperatingAgreement(fields) {
   // Operating agreement gerekip gerekmediğini belirleyen logic
-  return fields['Choose a company type'] === 'LLC'; // Örnek: LLC ise gerekli
+  const companyType = (fields['Choose a company type'] || '').toUpperCase();
+  return companyType === 'LLC' || companyType === 'LIMITED LIABILITY COMPANY';
 }
 
 function extractCountryCode(phone) {
@@ -317,8 +372,22 @@ function escapeSql(value) {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (typeof value === 'number') return value;
   
+  // JSON string ise özel işlem
+  if (typeof value === 'object') {
+    try {
+      const jsonStr = JSON.stringify(value);
+      return `'${jsonStr.replace(/'/g, "''")}'`;
+    } catch (e) {
+      return "''";
+    }
+  }
+  
   // String değerleri temizle ve escape et
-  return `'${String(value).replace(/'/g, "''").replace(/\\/g, '\\\\')}'`;
+  const str = String(value);
+  if (str === '') return "''";
+  
+  // Tırnak işaretlerini escape et
+  return `'${str.replace(/'/g, "''").replace(/\\/g, '\\\\')}'`;
 }
 
 // SQL oluştur
@@ -331,109 +400,115 @@ function generateSQL() {
 \n`;
 
   // 1. Orders insert
-  sql += `-- ORDERS TABLOSU\n`;
-  orders.forEach(order => {
-    sql += `INSERT INTO public.orders (id, user_id, woocommerce_order_id, company, currency, discount_total, transaction_id, created_at, is_deleted, deleted_at) VALUES (
-      ${order.id},
-      ${order.user_id},
-      ${escapeSql(order.woocommerce_order_id)},
-      ${escapeSql(order.company)},
-      ${escapeSql(order.currency)},
-      ${order.discount_total},
-      ${escapeSql(order.transaction_id)},
-      ${escapeSql(order.created_at)},
-      ${order.is_deleted},
-      ${escapeSql(order.deleted_at)}
-    );\n`;
-  });
+  if (orders.length > 0) {
+    sql += `-- ORDERS TABLOSU\n`;
+    orders.forEach(order => {
+      sql += `INSERT INTO public.orders (id, user_id, woocommerce_order_id, company, currency, discount_total, transaction_id, created_at, is_deleted, deleted_at) VALUES (
+        ${order.id},
+        ${order.user_id},
+        ${escapeSql(order.woocommerce_order_id)},
+        ${escapeSql(order.company)},
+        ${escapeSql(order.currency)},
+        ${order.discount_total},
+        ${escapeSql(order.transaction_id)},
+        ${escapeSql(order.created_at)},
+        ${order.is_deleted},
+        ${escapeSql(order.deleted_at)}
+      );\n`;
+    });
+  }
   
   // 2. Order Items insert
-  sql += `\n-- ORDER ITEMS TABLOSU\n`;
-  orderItems.forEach(item => {
-    sql += `INSERT INTO public.order_items (
-      id, orders_id, user_id, service_id, woocommerce_product_id, product_id, 
-      order_source, sku, product_name, quantity, subtotal, total, created_at, 
-      is_deleted, deleted_at, tax_filing_id, invoice_plan_id, operating_agreement_id, 
-      smart_bookkeeping_id, is_coupon_applied, coupon_code_id, coupon_amount, is_expedite_addon
-    ) VALUES (
-      ${item.id},
-      ${item.orders_id},
-      ${item.user_id},
-      ${escapeSql(item.service_id)},
-      ${escapeSql(item.woocommerce_product_id)},
-      ${item.product_id},
-      ${escapeSql(item.order_source)},
-      ${escapeSql(item.sku)},
-      ${escapeSql(item.product_name)},
-      ${item.quantity},
-      ${item.subtotal},
-      ${item.total},
-      ${escapeSql(item.created_at)},
-      ${item.is_deleted},
-      ${escapeSql(item.deleted_at)},
-      ${escapeSql(item.tax_filing_id)},
-      ${escapeSql(item.invoice_plan_id)},
-      ${escapeSql(item.operating_agreement_id)},
-      ${escapeSql(item.smart_bookkeeping_id)},
-      ${item.is_coupon_applied},
-      ${escapeSql(item.coupon_code_id)},
-      ${escapeSql(item.coupon_amount)},
-      ${item.is_expedite_addon}
-    );\n`;
-  });
+  if (orderItems.length > 0) {
+    sql += `\n-- ORDER ITEMS TABLOSU\n`;
+    orderItems.forEach(item => {
+      sql += `INSERT INTO public.order_items (
+        id, orders_id, user_id, service_id, woocommerce_product_id, product_id, 
+        order_source, sku, product_name, quantity, subtotal, total, created_at, 
+        is_deleted, deleted_at, tax_filing_id, invoice_plan_id, operating_agreement_id, 
+        smart_bookkeeping_id, is_coupon_applied, coupon_code_id, coupon_amount, is_expedite_addon
+      ) VALUES (
+        ${item.id},
+        ${item.orders_id},
+        ${item.user_id},
+        ${escapeSql(item.service_id)},
+        ${escapeSql(item.woocommerce_product_id)},
+        ${item.product_id},
+        ${escapeSql(item.order_source)},
+        ${escapeSql(item.sku)},
+        ${escapeSql(item.product_name)},
+        ${item.quantity},
+        ${item.subtotal},
+        ${item.total},
+        ${escapeSql(item.created_at)},
+        ${item.is_deleted},
+        ${escapeSql(item.deleted_at)},
+        ${escapeSql(item.tax_filing_id)},
+        ${escapeSql(item.invoice_plan_id)},
+        ${escapeSql(item.operating_agreement_id)},
+        ${escapeSql(item.smart_bookkeeping_id)},
+        ${item.is_coupon_applied},
+        ${escapeSql(item.coupon_code_id)},
+        ${escapeSql(item.coupon_amount)},
+        ${item.is_expedite_addon}
+      );\n`;
+    });
+  }
   
   // 3. Incorporations insert
-  sql += `\n-- INCORPORATIONS TABLOSU\n`;
-  incorporations.forEach(inc => {
-    sql += `INSERT INTO public.incorporations (
-      id, user_id, order_id, first_name, middle_name, last_name, email, 
-      phone_number, address, country, state, city, country_code, zip_code, 
-      company_members, company_type, preferred_name_1, preferred_name_2, 
-      preferred_name_3, industry_type, business_description, genrating_revenue, 
-      annual_revenue, employees_count, is_us_company, website_name, scan_passport, 
-      extracted_data, created_at, last_updated_at, deleted_at, is_deleted, status, 
-      llc_document_file, ein_form_file, ss4_extracted_data, signed_ein_form, llc_extracted_data
-    ) VALUES (
-      ${inc.id},
-      ${inc.user_id},
-      ${inc.order_id},
-      ${escapeSql(inc.first_name)},
-      ${escapeSql(inc.middle_name)},
-      ${escapeSql(inc.last_name)},
-      ${escapeSql(inc.email)},
-      ${escapeSql(inc.phone_number)},
-      ${escapeSql(inc.address)},
-      ${inc.country},
-      ${escapeSql(inc.state)},
-      ${escapeSql(inc.city)},
-      ${escapeSql(inc.country_code)},
-      ${escapeSql(inc.zip_code)},
-      ${escapeSql(inc.company_members)},
-      ${inc.company_type},
-      ${escapeSql(inc.preferred_name_1)},
-      ${escapeSql(inc.preferred_name_2)},
-      ${escapeSql(inc.preferred_name_3)},
-      ${inc.industry_type},
-      ${escapeSql(inc.business_description)},
-      ${inc.genrating_revenue},
-      ${escapeSql(inc.annual_revenue)},
-      ${escapeSql(inc.employees_count)},
-      ${inc.is_us_company},
-      ${escapeSql(inc.website_name)},
-      ${escapeSql(inc.scan_passport)},
-      ${escapeSql(inc.extracted_data)},
-      ${escapeSql(inc.created_at)},
-      ${escapeSql(inc.last_updated_at)},
-      ${escapeSql(inc.deleted_at)},
-      ${inc.is_deleted},
-      ${inc.status},
-      ${escapeSql(inc.llc_document_file)},
-      ${escapeSql(inc.ein_form_file)},
-      ${escapeSql(inc.ss4_extracted_data)},
-      ${escapeSql(inc.signed_ein_form)},
-      ${escapeSql(inc.llc_extracted_data)}
-    );\n`;
-  });
+  if (incorporations.length > 0) {
+    sql += `\n-- INCORPORATIONS TABLOSU\n`;
+    incorporations.forEach(inc => {
+      sql += `INSERT INTO public.incorporations (
+        id, user_id, order_id, first_name, middle_name, last_name, email, 
+        phone_number, address, country, state, city, country_code, zip_code, 
+        company_members, company_type, preferred_name_1, preferred_name_2, 
+        preferred_name_3, industry_type, business_description, genrating_revenue, 
+        annual_revenue, employees_count, is_us_company, website_name, scan_passport, 
+        extracted_data, created_at, last_updated_at, deleted_at, is_deleted, status, 
+        llc_document_file, ein_form_file, ss4_extracted_data, signed_ein_form, llc_extracted_data
+      ) VALUES (
+        ${inc.id},
+        ${inc.user_id},
+        ${inc.order_id},
+        ${escapeSql(inc.first_name)},
+        ${escapeSql(inc.middle_name)},
+        ${escapeSql(inc.last_name)},
+        ${escapeSql(inc.email)},
+        ${escapeSql(inc.phone_number)},
+        ${escapeSql(inc.address)},
+        ${inc.country},
+        ${escapeSql(inc.state)},
+        ${escapeSql(inc.city)},
+        ${escapeSql(inc.country_code)},
+        ${escapeSql(inc.zip_code)},
+        ${escapeSql(inc.company_members)},
+        ${inc.company_type},
+        ${escapeSql(inc.preferred_name_1)},
+        ${escapeSql(inc.preferred_name_2)},
+        ${escapeSql(inc.preferred_name_3)},
+        ${inc.industry_type},
+        ${escapeSql(inc.business_description)},
+        ${inc.genrating_revenue},
+        ${escapeSql(inc.annual_revenue)},
+        ${escapeSql(inc.employees_count)},
+        ${inc.is_us_company},
+        ${escapeSql(inc.website_name)},
+        ${escapeSql(inc.scan_passport)},
+        ${escapeSql(inc.extracted_data)},
+        ${escapeSql(inc.created_at)},
+        ${escapeSql(inc.last_updated_at)},
+        ${escapeSql(inc.deleted_at)},
+        ${inc.is_deleted},
+        ${inc.status},
+        ${escapeSql(inc.llc_document_file)},
+        ${escapeSql(inc.ein_form_file)},
+        ${escapeSql(inc.ss4_extracted_data)},
+        ${escapeSql(inc.signed_ein_form)},
+        ${escapeSql(inc.llc_extracted_data)}
+      );\n`;
+    });
+  }
   
   // 4. ITIN Applications insert (eğer varsa)
   if (itinApplications.length > 0) {
@@ -499,14 +574,20 @@ function generateSQL() {
   
   // Sequence güncellemeleri
   sql += `\n-- SEQUENCE GÜNCELLEMELERİ\n`;
-  sql += `SELECT setval('public.orders_id_seq', (SELECT MAX(id) FROM public.orders));\n`;
-  sql += `SELECT setval('public.order_items_id_seq', (SELECT MAX(id) FROM public.order_items));\n`;
-  sql += `SELECT setval('public.incorporations_id_seq', (SELECT MAX(id) FROM public.incorporations));\n`;
+  if (orders.length > 0) {
+    sql += `SELECT setval('public.orders_id_seq', (SELECT MAX(id) FROM public.orders) + 100);\n`;
+  }
+  if (orderItems.length > 0) {
+    sql += `SELECT setval('public.order_items_id_seq', (SELECT MAX(id) FROM public.order_items) + 100);\n`;
+  }
+  if (incorporations.length > 0) {
+    sql += `SELECT setval('public.incorporations_id_seq', (SELECT MAX(id) FROM public.incorporations) + 100);\n`;
+  }
   if (itinApplications.length > 0) {
-    sql += `SELECT setval('public.itin_applications_id_seq', (SELECT MAX(id) FROM public.itin_applications));\n`;
+    sql += `SELECT setval('public.itin_applications_id_seq', (SELECT MAX(id) FROM public.itin_applications) + 100);\n`;
   }
   if (operatingAgreements.length > 0) {
-    sql += `SELECT setval('public.operating_agreements_id_seq', (SELECT MAX(id) FROM public.operating_agreements));\n`;
+    sql += `SELECT setval('public.operating_agreements_id_seq', (SELECT MAX(id) FROM public.operating_agreements) + 100);\n`;
   }
   
   return sql;
@@ -515,11 +596,13 @@ function generateSQL() {
 // Ana işlem
 async function main() {
   try {
+    console.log('📁 CSV to SQL Converter başlatılıyor...');
+    
     // Gerekli paketleri kontrol et
     try {
       require('csv-parser');
     } catch (e) {
-      console.error('Gerekli paketler yüklenmemiş. Lütfen çalıştırın:');
+      console.error('❌ Gerekli paketler yüklenmemiş. Lütfen çalıştırın:');
       console.error('npm install csv-parser');
       process.exit(1);
     }
@@ -527,22 +610,34 @@ async function main() {
     // CSV'yi işle
     await processCSV();
     
+    if (orders.length === 0) {
+      console.log('⚠️  İşlenecek veri bulunamadı. CSV formatını kontrol edin.');
+      console.log('   CSV formatı: field_title,field_value,order_number');
+      process.exit(0);
+    }
+    
     // SQL oluştur
     const sql = generateSQL();
     
     // Dosyaya yaz
     fs.writeFileSync(CONFIG.outputFile, sql, 'utf8');
     
-    console.log(`✅ SQL dosyası oluşturuldu: ${CONFIG.outputFile}`);
-    console.log(`📊 İstatistikler:`);
+    console.log(`\n✅ SQL dosyası oluşturuldu: ${CONFIG.outputFile}`);
+    console.log(`\n📊 İSTATİSTİKLER:`);
     console.log(`   - Orders: ${orders.length}`);
     console.log(`   - Order Items: ${orderItems.length}`);
     console.log(`   - Incorporations: ${incorporations.length}`);
     console.log(`   - ITIN Applications: ${itinApplications.length}`);
     console.log(`   - Operating Agreements: ${operatingAgreements.length}`);
     
+    console.log(`\n📋 SONRAKİ ADIMLAR:`);
+    console.log(`   1. ${CONFIG.outputFile} dosyasını PostgreSQL'de çalıştırın`);
+    console.log(`   2. ID mapping'leri gerçek veritabanınıza göre güncelleyin`);
+    console.log(`   3. Gerekirse ek tablolar için script'i genişletin`);
+    
   } catch (error) {
     console.error('❌ Hata oluştu:', error.message);
+    console.error(error.stack);
     process.exit(1);
   }
 }
